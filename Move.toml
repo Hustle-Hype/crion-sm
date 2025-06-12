@@ -1,0 +1,16 @@
+[package]
+name = "fa_factory"
+version = "1.0.0"
+authors = []
+
+[addresses]
+fa_factory = "_"
+
+
+
+[dependencies.AptosFramework]
+local = "../aptos-framework/aptos-framework"
+rev = "mainnet"
+subdir = "aptos-framework"
+
+[dev-dependencies]
