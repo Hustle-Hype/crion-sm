@@ -14,17 +14,19 @@ module fa_factory::fa_factory {
     const EINSUFFICIENT_FUNDS: u64 = 101;
     const EINSUFFICIENT_TOKEN_BALANCE: u64 = 102;
     const EINVALID_AMOUNT: u64 = 103;
+    const EINSUFFICIENT_CONTRACT_TOKENS: u64 = 104;
 
     struct ManagedFA has key {
         symbol: vector<u8>,
         mint: MintRef,
         burn: BurnRef,
         transfer: TransferRef,
-        extend: ExtendRef,  // Add ExtendRef for generating signer
-        reserve: u64,      // APT reserve trong pool
-        supply: u64,       // Token supply hiện tại
-        k: u64,           // Constant cho bonding curve
-        fee_rate: u64,    // Fee rate (basis points, e.g., 100 = 1%)
+        extend: ExtendRef,
+        reserve: u64,           // APT reserve trong pool
+        total_supply: u64,      // Total supply (cố định)
+        circulating_supply: u64, // Số token đang lưu hành (bán ra ngoài)
+        k: u64,                 // Constant cho bonding curve
+        fee_rate: u64,          // Fee rate (basis points, e.g., 100 = 1%)
     }
 
     // Event structures
@@ -32,6 +34,7 @@ module fa_factory::fa_factory {
     struct TokenCreated has drop, store {
         symbol: vector<u8>,
         creator: address,
+        total_supply: u64,
         k: u64,
     }
 
@@ -41,7 +44,7 @@ module fa_factory::fa_factory {
         symbol: vector<u8>,
         apt_paid: u64,
         tokens_received: u64,
-        new_supply: u64,
+        new_circulating_supply: u64,
         new_reserve: u64,
     }
 
@@ -51,7 +54,7 @@ module fa_factory::fa_factory {
         symbol: vector<u8>,
         tokens_sold: u64,
         apt_received: u64,
-        new_supply: u64,
+        new_circulating_supply: u64,
         new_reserve: u64,
     }
 
@@ -62,8 +65,9 @@ module fa_factory::fa_factory {
         icon: vector<u8>,
         project_url: vector<u8>,
         decimals: u8,
+        total_supply: u64,      // Fixed total supply
         k: u64,
-        fee_rate: u64  // Fee rate in basis points (100 = 1%)
+        fee_rate: u64
     ) {
         let constructor = &object::create_named_object(admin, symbol);
 
@@ -87,6 +91,15 @@ module fa_factory::fa_factory {
         // Register the contract to receive APT
         coin::register<AptosCoin>(&signer_for_asset);
         
+        // Mint toàn bộ supply cho contract
+        let asset = object::object_from_constructor_ref<Metadata>(constructor);
+        let contract_store = primary_fungible_store::ensure_primary_store_exists(
+            signer::address_of(&signer_for_asset), 
+            asset
+        );
+        let total_tokens = fungible_asset::mint(&mint, total_supply);
+        fungible_asset::deposit_with_ref(&transfer, contract_store, total_tokens);
+        
         move_to(&signer_for_asset, ManagedFA {
             symbol,
             mint,
@@ -94,7 +107,8 @@ module fa_factory::fa_factory {
             transfer,
             extend,
             reserve: 0,
-            supply: 0,
+            total_supply,
+            circulating_supply: 0,  // Chưa có token nào được bán ra
             k,
             fee_rate,
         });
@@ -103,6 +117,7 @@ module fa_factory::fa_factory {
         event::emit(TokenCreated {
             symbol,
             creator: signer::address_of(admin),
+            total_supply,
             k,
         });
     }
@@ -112,7 +127,7 @@ module fa_factory::fa_factory {
         object::address_to_object<Metadata>(addr)
     }
 
-    // Buy tokens with APT - anyone can call this
+    // Buy tokens with APT - chuyển token từ contract sang buyer
     public entry fun buy_tokens(
         buyer: &signer,
         symbol: vector<u8>,
@@ -132,34 +147,41 @@ module fa_factory::fa_factory {
         let fee = (apt_amount * fa.fee_rate) / 10000;
         let net_amount = apt_amount - fee;
 
-        // Calculate tokens to mint based on bonding curve
-        let mint_amount = compute_mint_amount(fa.k, fa.supply, net_amount);
+        // Calculate tokens to transfer based on bonding curve
+        let token_amount = compute_buy_amount(fa.k, fa.circulating_supply, net_amount);
         
+        // Check contract has enough tokens
+        let contract_signer = object::generate_signer_for_extending(&fa.extend);
+        let contract_store = primary_fungible_store::primary_store(
+            signer::address_of(&contract_signer), 
+            asset
+        );
+        assert!(fungible_asset::balance(contract_store) >= token_amount,
+                error::invalid_argument(EINSUFFICIENT_CONTRACT_TOKENS));
+
         // Update state
         fa.reserve = fa.reserve + net_amount;
-        fa.supply = fa.supply + mint_amount;
+        fa.circulating_supply = fa.circulating_supply + token_amount;
 
         // Transfer APT from buyer to contract
-        let contract_signer = object::generate_signer_for_extending(&fa.extend);
         coin::transfer<AptosCoin>(buyer, signer::address_of(&contract_signer), apt_amount);
 
-        // Mint and transfer tokens to buyer
+        // Transfer tokens from contract to buyer
         let buyer_store = primary_fungible_store::ensure_primary_store_exists(buyer_addr, asset);
-        let minted = fungible_asset::mint(&fa.mint, mint_amount);
-        fungible_asset::deposit_with_ref(&fa.transfer, buyer_store, minted);
+        fungible_asset::transfer_with_ref(&fa.transfer, contract_store, buyer_store, token_amount);
 
         // Emit event
         event::emit(TokenBought {
             buyer: buyer_addr,
             symbol: fa.symbol,
             apt_paid: apt_amount,
-            tokens_received: mint_amount,
-            new_supply: fa.supply,
+            tokens_received: token_amount,
+            new_circulating_supply: fa.circulating_supply,
             new_reserve: fa.reserve,
         });
     }
 
-    // Sell tokens for APT - anyone can call this
+    // Sell tokens for APT - chuyển token từ seller về contract
     public entry fun sell_tokens(
         seller: &signer,
         symbol: vector<u8>,
@@ -177,7 +199,7 @@ module fa_factory::fa_factory {
                 error::invalid_argument(EINSUFFICIENT_TOKEN_BALANCE));
 
         // Calculate APT to return based on bonding curve
-        let apt_refund = compute_refund_amount(fa.k, fa.supply, token_amount);
+        let apt_refund = compute_sell_amount(fa.k, fa.circulating_supply, token_amount);
         let fee = (apt_refund * fa.fee_rate) / 10000;
         let net_refund = apt_refund - fee;
         
@@ -185,13 +207,17 @@ module fa_factory::fa_factory {
 
         // Update state
         fa.reserve = fa.reserve - apt_refund;
-        fa.supply = fa.supply - token_amount;
+        fa.circulating_supply = fa.circulating_supply - token_amount;
 
-        // Burn tokens from seller
-        fungible_asset::burn_from(&fa.burn, seller_store, token_amount);
+        // Transfer tokens from seller to contract
+        let contract_signer = object::generate_signer_for_extending(&fa.extend);
+        let contract_store = primary_fungible_store::primary_store(
+            signer::address_of(&contract_signer), 
+            asset
+        );
+        fungible_asset::transfer_with_ref(&fa.transfer, seller_store, contract_store, token_amount);
 
         // Transfer APT to seller
-        let contract_signer = object::generate_signer_for_extending(&fa.extend);
         coin::transfer<AptosCoin>(&contract_signer, seller_addr, net_refund);
 
         // Emit event
@@ -200,36 +226,39 @@ module fa_factory::fa_factory {
             symbol: fa.symbol,
             tokens_sold: token_amount,
             apt_received: net_refund,
-            new_supply: fa.supply,
+            new_circulating_supply: fa.circulating_supply,
             new_reserve: fa.reserve,
         });
     }
 
     // Get current price for buying tokens
+    #[view]
     public fun get_buy_price(symbol: vector<u8>, apt_amount: u64): u64 acquires ManagedFA {
         let asset = get_metadata(symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
         
         let fee = (apt_amount * fa.fee_rate) / 10000;
         let net_amount = apt_amount - fee;
-        compute_mint_amount(fa.k, fa.supply, net_amount)
+        compute_buy_amount(fa.k, fa.circulating_supply, net_amount)
     }
 
     // Get current price for selling tokens
+    #[view]
     public fun get_sell_price(symbol: vector<u8>, token_amount: u64): u64 acquires ManagedFA {
         let asset = get_metadata(symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
         
-        let apt_refund = compute_refund_amount(fa.k, fa.supply, token_amount);
+        let apt_refund = compute_sell_amount(fa.k, fa.circulating_supply, token_amount);
         let fee = (apt_refund * fa.fee_rate) / 10000;
         apt_refund - fee
     }
 
     // Get token info
-    public fun get_token_info(symbol: vector<u8>): (u64, u64, u64, u64) acquires ManagedFA {
+    #[view]
+    public fun get_token_info(symbol: vector<u8>): (u64, u64, u64, u64, u64) acquires ManagedFA {
         let asset = get_metadata(symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
-        (fa.reserve, fa.supply, fa.k, fa.fee_rate)
+        (fa.reserve, fa.total_supply, fa.circulating_supply, fa.k, fa.fee_rate)
     }
 
     // Admin function to withdraw fees
@@ -252,11 +281,10 @@ module fa_factory::fa_factory {
         coin::transfer<AptosCoin>(&contract_signer, signer::address_of(admin), amount);
     }
 
-    // Improved bonding curve: price increases as supply increases
-    fun compute_mint_amount(k: u64, current_supply: u64, apt_paid: u64): u64 {
-        // Simple linear bonding curve: price = k * supply
-        // tokens = apt_paid / (k + current_supply/1000000)
-        let adjusted_k = k + (current_supply / 1000000);
+    // Bonding curve cho việc mua token
+    fun compute_buy_amount(k: u64, current_circulating: u64, apt_paid: u64): u64 {
+        // Giá tăng theo số lượng circulating
+        let adjusted_k = k + (current_circulating / 1000000);
         if (adjusted_k == 0) {
             apt_paid
         } else {
@@ -264,10 +292,11 @@ module fa_factory::fa_factory {
         }
     }
 
-    fun compute_refund_amount(k: u64, current_supply: u64, token_amount: u64): u64 {
-        // Reverse of mint calculation
-        let new_supply = current_supply - token_amount;
-        let adjusted_k = k + (new_supply / 1000000);
+    // Bonding curve cho việc bán token
+    fun compute_sell_amount(k: u64, current_circulating: u64, token_amount: u64): u64 {
+        // Tính APT nhận được khi bán
+        let new_circulating = current_circulating - token_amount;
+        let adjusted_k = k + (new_circulating / 1000000);
         if (adjusted_k == 0) {
             token_amount
         } else {
