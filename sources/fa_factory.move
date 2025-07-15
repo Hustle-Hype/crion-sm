@@ -8,6 +8,7 @@ module fa_factory::fa_factory {
     use aptos_framework::primary_fungible_store;
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::coin;
+    use aptos_framework::timestamp;
     use aptos_framework::event;
 
     const ENOT_OWNER: u64 = 100;
@@ -28,6 +29,19 @@ module fa_factory::fa_factory {
         circulating_supply: u64, // Số token đang lưu hành (bán ra ngoài)
         k: u64,                 // Constant cho bonding curve
         fee_rate: u64,          // Fee rate (basis points, e.g., 100 = 1%)
+        // RWA specific fields
+        asset_type: vector<u8>, // Loại tài sản (real estate, commodities, stocks, etc.)
+        backing_ratio: u64,     // Tỷ lệ backing bằng tài sản thực (basis points)
+        withdrawal_limit: u64,  // Giới hạn rút APT (basis points của reserve)
+        last_withdrawal: u64,   // Timestamp lần rút cuối
+        withdrawal_cooldown: u64, // Cooldown period giữa các lần rút
+        is_emergency: bool,     // Emergency mode
+        // Bonding curve progress
+        graduation_threshold: u64, // Ngưỡng để "graduate" khỏi bonding curve
+        graduation_target: u64,   // Target market cap để graduate
+        is_graduated: bool,       // Đã graduate chưa
+        oracle_price: u64,        // Giá từ oracle (sau khi graduate)
+        last_oracle_update: u64,  // Timestamp update oracle cuối
     }
 
     // Event structures
@@ -38,6 +52,8 @@ module fa_factory::fa_factory {
         total_supply: u64,
         k: u64,
         object_address: address,
+        asset_type: vector<u8>,
+        backing_ratio: u64,
     }
 
     #[event]
@@ -60,6 +76,41 @@ module fa_factory::fa_factory {
         new_reserve: u64,
     }
 
+    #[event]
+    struct ReserveWithdrawn has drop, store {
+        creator: address,
+        symbol: vector<u8>,
+        amount_withdrawn: u64,
+        remaining_reserve: u64,
+        timestamp: u64,
+    }
+
+    #[event]
+    struct EmergencyWithdrawn has drop, store {
+        creator: address,
+        symbol: vector<u8>,
+        amount_withdrawn: u64,
+        reason: vector<u8>,
+        timestamp: u64,
+    }
+
+    #[event]
+    struct OraclePriceUpdated has drop, store {
+        creator: address,
+        symbol: vector<u8>,
+        new_price: u64,
+        timestamp: u64,
+    }
+
+    #[event]
+    struct TokenGraduated has drop, store {
+        creator: address,
+        symbol: vector<u8>,
+        final_circulating_supply: u64,
+        final_reserve: u64,
+        timestamp: u64,
+    }
+
     public entry fun create_token(
         creator: &signer,
         symbol: vector<u8>,
@@ -69,7 +120,13 @@ module fa_factory::fa_factory {
         decimals: u8,
         total_supply: u64,      // Fixed total supply
         k: u64,
-        fee_rate: u64
+        fee_rate: u64,
+        asset_type: vector<u8>,
+        backing_ratio: u64,
+        withdrawal_limit: u64,
+        withdrawal_cooldown: u64,
+        graduation_threshold: u64,
+        graduation_target: u64
     ) {
         let creator_addr = signer::address_of(creator);
         
@@ -119,6 +176,17 @@ module fa_factory::fa_factory {
             circulating_supply: 0,  // Chưa có token nào được bán ra
             k,
             fee_rate,
+            asset_type,
+            backing_ratio,
+            withdrawal_limit,
+            last_withdrawal: 0,
+            withdrawal_cooldown,
+            is_emergency: false,
+            graduation_threshold,
+            graduation_target,
+            is_graduated: false,
+            oracle_price: 0,
+            last_oracle_update: 0,
         });
 
         // Emit event
@@ -128,6 +196,8 @@ module fa_factory::fa_factory {
             total_supply,
             k,
             object_address: object_addr,
+            asset_type,
+            backing_ratio,
         });
     }
 
@@ -164,8 +234,15 @@ module fa_factory::fa_factory {
         let fee = (apt_amount * fa.fee_rate) / 10000;
         let net_amount = apt_amount - fee;
 
-        // Calculate tokens to receive based on bonding curve
-        let token_amount = compute_buy_amount(fa.k, fa.circulating_supply, net_amount);
+        // Calculate tokens to receive based on bonding curve or oracle price
+        let token_amount = if (fa.is_graduated) {
+            // Đã graduate: dùng oracle price
+            assert!(fa.oracle_price > 0, error::invalid_state(108)); // ENO_ORACLE_PRICE
+            net_amount / fa.oracle_price
+        } else {
+            // Chưa graduate: dùng bonding curve
+            compute_buy_amount(fa.k, fa.circulating_supply, net_amount)
+        };
         
         // Check contract has enough tokens
         let contract_store = primary_fungible_store::primary_store(object_addr, asset);
@@ -176,6 +253,9 @@ module fa_factory::fa_factory {
         // Update state BEFORE transfers
         fa.reserve = fa.reserve + net_amount;
         fa.circulating_supply = fa.circulating_supply + token_amount;
+
+        // Check graduation condition
+        check_graduation(fa);
 
         // Transfer APT from buyer to contract
         coin::transfer<AptosCoin>(buyer, object_addr, apt_amount);
@@ -215,8 +295,16 @@ module fa_factory::fa_factory {
         assert!(fungible_asset::balance(seller_store) >= token_amount,
                 error::invalid_argument(EINSUFFICIENT_TOKEN_BALANCE));
 
-        // Calculate APT to return based on bonding curve
-        let apt_refund = compute_sell_amount(fa.k, fa.circulating_supply, token_amount);
+        // Calculate APT to return based on bonding curve or oracle price
+        let apt_refund = if (fa.is_graduated) {
+            // Đã graduate: dùng oracle price
+            assert!(fa.oracle_price > 0, error::invalid_state(108)); // ENO_ORACLE_PRICE
+            token_amount * fa.oracle_price
+        } else {
+            // Chưa graduate: dùng bonding curve
+            compute_sell_amount(fa.k, fa.circulating_supply, token_amount)
+        };
+        
         let fee = (apt_refund * fa.fee_rate) / 10000;
         let net_refund = apt_refund - fee;
         
@@ -255,7 +343,13 @@ module fa_factory::fa_factory {
         
         let fee = (apt_amount * fa.fee_rate) / 10000;
         let net_amount = apt_amount - fee;
-        compute_buy_amount(fa.k, fa.circulating_supply, net_amount)
+        
+        if (fa.is_graduated) {
+            assert!(fa.oracle_price > 0, error::invalid_state(108));
+            net_amount / fa.oracle_price
+        } else {
+            compute_buy_amount(fa.k, fa.circulating_supply, net_amount)
+        }
     }
 
     // Get current price for selling tokens
@@ -264,24 +358,90 @@ module fa_factory::fa_factory {
         let asset = get_metadata(creator, symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
         
-        let apt_refund = compute_sell_amount(fa.k, fa.circulating_supply, token_amount);
+        let apt_refund = if (fa.is_graduated) {
+            assert!(fa.oracle_price > 0, error::invalid_state(108));
+            token_amount * fa.oracle_price
+        } else {
+            compute_sell_amount(fa.k, fa.circulating_supply, token_amount)
+        };
+        
         let fee = (apt_refund * fa.fee_rate) / 10000;
         apt_refund - fee
     }
 
     // Get token info
     #[view]
-    public fun get_token_info(creator: address, symbol: vector<u8>): (address, u64, u64, u64, u64, u64) acquires ManagedFA {
+    public fun get_token_info(creator: address, symbol: vector<u8>): (address, u64, u64, u64, u64, u64, vector<u8>, u64, bool, bool, u64, u64) acquires ManagedFA {
         let asset = get_metadata(creator, symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
-        (fa.creator, fa.reserve, fa.total_supply, fa.circulating_supply, fa.k, fa.fee_rate)
+        (fa.creator, fa.reserve, fa.total_supply, fa.circulating_supply, fa.k, fa.fee_rate, fa.asset_type, fa.backing_ratio, fa.is_emergency, fa.is_graduated, fa.graduation_threshold, fa.graduation_target)
     }
 
-    // Check if token exists
+    // Get graduation progress
     #[view]
-    public fun token_exists(creator: address, symbol: vector<u8>): bool {
-        let addr = object::create_object_address(&creator, symbol);
-        exists<ManagedFA>(addr)
+    public fun get_graduation_progress(creator: address, symbol: vector<u8>): (u64, u64, u64, bool) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let fa = borrow_global<ManagedFA>(object::object_address(&asset));
+        let current_progress = if (fa.graduation_target > 0) {
+            (fa.circulating_supply * 10000) / fa.graduation_target
+        } else {
+            0
+        };
+        (fa.circulating_supply, fa.graduation_target, current_progress, fa.is_graduated)
+    }
+
+    // Update oracle price (chỉ sau khi graduate)
+    public entry fun update_oracle_price(
+        admin: &signer,
+        creator: address,
+        symbol: vector<u8>,
+        new_price: u64
+    ) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let fa = borrow_global_mut<ManagedFA>(object::object_address(&asset));
+        
+        assert!(signer::address_of(admin) == fa.creator, 
+                error::permission_denied(ENOT_OWNER));
+        assert!(fa.is_graduated, error::invalid_state(109)); // ENOT_GRADUATED
+        assert!(new_price > 0, error::invalid_argument(EINVALID_AMOUNT));
+        
+        fa.oracle_price = new_price;
+        fa.last_oracle_update = timestamp::now_seconds();
+        
+        // Emit event
+        event::emit(OraclePriceUpdated {
+            creator: fa.creator,
+            symbol: fa.symbol,
+            new_price,
+            timestamp: fa.last_oracle_update,
+        });
+    }
+
+    // Check graduation condition
+    fun check_graduation(fa: &mut ManagedFA) {
+        if (!fa.is_graduated && fa.circulating_supply >= fa.graduation_threshold) {
+            fa.is_graduated = true;
+            
+            // Emit graduation event
+            event::emit(TokenGraduated {
+                creator: fa.creator,
+                symbol: fa.symbol,
+                final_circulating_supply: fa.circulating_supply,
+                final_reserve: fa.reserve,
+                timestamp: timestamp::now_seconds(),
+            });
+        }
+    }
+
+    // Get withdrawal info
+    #[view]
+    public fun get_withdrawal_info(creator: address, symbol: vector<u8>): (u64, u64, u64, u64) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let fa = borrow_global<ManagedFA>(object::object_address(&asset));
+        let now = aptos_framework::timestamp::now_seconds();
+        let next_withdrawal = fa.last_withdrawal + fa.withdrawal_cooldown;
+        let max_withdrawal = (fa.reserve * fa.withdrawal_limit) / 10000;
+        (fa.withdrawal_limit, next_withdrawal, max_withdrawal, fa.last_withdrawal)
     }
 
     // Admin function to withdraw fees
@@ -305,6 +465,104 @@ module fa_factory::fa_factory {
 
         let contract_signer = object::generate_signer_for_extending(&fa.extend);
         coin::transfer<AptosCoin>(&contract_signer, signer::address_of(admin), amount);
+    }
+
+    // Check if token exists
+    #[view]
+    public fun token_exists(creator: address, symbol: vector<u8>): bool {
+        let addr = object::create_object_address(&creator, symbol);
+        exists<ManagedFA>(addr)
+    }
+
+    // RWA: Withdraw reserve theo giới hạn
+    public entry fun withdraw_reserve(
+        admin: &signer,
+        creator: address,
+        symbol: vector<u8>,
+        amount: u64
+    ) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let object_addr = object::object_address(&asset);
+        let fa = borrow_global_mut<ManagedFA>(object_addr);
+        
+        assert!(signer::address_of(admin) == fa.creator, 
+                error::permission_denied(ENOT_OWNER));
+        
+        // Check cooldown
+        let now = aptos_framework::timestamp::now_seconds();
+        assert!(now >= fa.last_withdrawal + fa.withdrawal_cooldown,
+                error::invalid_state(105)); // ECOOLDOWN_NOT_EXPIRED
+        
+        // Check withdrawal limit
+        let max_withdrawal = (fa.reserve * fa.withdrawal_limit) / 10000;
+        assert!(amount <= max_withdrawal, 
+                error::invalid_argument(106)); // EEXCEEDS_WITHDRAWAL_LIMIT
+        
+        // Ensure minimum backing ratio
+        let remaining_reserve = fa.reserve - amount;
+        let required_backing = (fa.circulating_supply * fa.backing_ratio) / 10000;
+        assert!(remaining_reserve >= required_backing,
+                error::invalid_argument(107)); // EINSUFFICIENT_BACKING
+        
+        // Update state
+        fa.reserve = remaining_reserve;
+        fa.last_withdrawal = now;
+        
+        // Transfer APT
+        let contract_signer = object::generate_signer_for_extending(&fa.extend);
+        coin::transfer<AptosCoin>(&contract_signer, signer::address_of(admin), amount);
+        
+        // Emit event
+        event::emit(ReserveWithdrawn {
+            creator: fa.creator,
+            symbol: fa.symbol,
+            amount_withdrawn: amount,
+            remaining_reserve: fa.reserve,
+            timestamp: now,
+        });
+    }
+
+    // Emergency withdrawal - chỉ dùng khi cần thiết
+    public entry fun emergency_withdraw(
+        admin: &signer,
+        creator: address,
+        symbol: vector<u8>,
+        amount: u64,
+        reason: vector<u8>
+    ) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let object_addr = object::object_address(&asset);
+        let fa = borrow_global_mut<ManagedFA>(object_addr);
+        
+        assert!(signer::address_of(admin) == fa.creator, 
+                error::permission_denied(ENOT_OWNER));
+        
+        // Enable emergency mode
+        fa.is_emergency = true;
+        
+        let contract_balance = coin::balance<AptosCoin>(object_addr);
+        assert!(amount <= contract_balance, 
+                error::invalid_argument(EINSUFFICIENT_FUNDS));
+        
+        // Update reserve
+        if (amount <= fa.reserve) {
+            fa.reserve = fa.reserve - amount;
+        } else {
+            fa.reserve = 0;
+        };
+        
+        // Transfer APT
+        let contract_signer = object::generate_signer_for_extending(&fa.extend);
+        coin::transfer<AptosCoin>(&contract_signer, signer::address_of(admin), amount);
+        
+        // Emit event
+        event::emit(EmergencyWithdrawn {
+            creator: fa.creator,
+            symbol: fa.symbol,
+            amount_withdrawn: amount,
+            reason,
+            timestamp: aptos_framework::timestamp::now_seconds(),
+        });
     }
 
     // Bonding curve cho việc mua token - giá tăng khi circulating supply tăng
