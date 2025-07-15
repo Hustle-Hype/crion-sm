@@ -19,6 +19,11 @@ module fa_factory::fa_factory {
 
     struct ManagedFA has key {
         symbol: vector<u8>,
+        name: vector<u8>,
+        decimals: u8,
+        icon_url: vector<u8>,
+        project_url: vector<u8>,
+        description: vector<u8>,
         mint: MintRef,
         burn: BurnRef,
         transfer: TransferRef,
@@ -48,6 +53,11 @@ module fa_factory::fa_factory {
     #[event]
     struct TokenCreated has drop, store {
         symbol: vector<u8>,
+        name: vector<u8>,
+        decimals: u8,
+        icon_url: vector<u8>,
+        project_url: vector<u8>,
+        description: vector<u8>,
         creator: address,
         total_supply: u64,
         k: u64,
@@ -117,6 +127,7 @@ module fa_factory::fa_factory {
         name: vector<u8>,
         icon: vector<u8>,
         project_url: vector<u8>,
+        description: vector<u8>,
         decimals: u8,
         total_supply: u64,      // Fixed total supply
         k: u64,
@@ -166,6 +177,11 @@ module fa_factory::fa_factory {
         // Lưu thông tin contract
         move_to(&object_signer, ManagedFA {
             symbol,
+            name,
+            decimals,
+            icon_url: icon,
+            project_url,
+            description,
             mint,
             burn,
             transfer,
@@ -192,6 +208,11 @@ module fa_factory::fa_factory {
         // Emit event
         event::emit(TokenCreated {
             symbol,
+            name,
+            decimals,
+            icon_url: icon,
+            project_url,
+            description,
             creator: creator_addr,
             total_supply,
             k,
@@ -375,6 +396,97 @@ module fa_factory::fa_factory {
         let asset = get_metadata(creator, symbol);
         let fa = borrow_global<ManagedFA>(object::object_address(&asset));
         (fa.creator, fa.reserve, fa.total_supply, fa.circulating_supply, fa.k, fa.fee_rate, fa.asset_type, fa.backing_ratio, fa.is_emergency, fa.is_graduated, fa.graduation_threshold, fa.graduation_target)
+    }
+
+    // Get full token info including all metadata and current state
+    #[view]
+    public fun get_full_token_info(creator: address, symbol: vector<u8>): (
+        // Basic token info
+        vector<u8>,  // symbol
+        vector<u8>,  // name
+        u8,          // decimals
+        vector<u8>,  // icon_url
+        vector<u8>,  // project_url
+        vector<u8>,  // description
+        address,     // creator
+        u64,         // total_supply
+        u64,         // circulating_supply
+        // Bonding curve params
+        u64,         // k
+        u64,         // fee_rate
+        // RWA params
+        vector<u8>,  // asset_type
+        u64,         // backing_ratio
+        u64,         // withdrawal_limit
+        u64,         // withdrawal_cooldown
+        // Graduation params
+        u64,         // graduation_threshold
+        u64,         // graduation_target
+        bool,        // is_graduated
+        u64,         // oracle_price
+        // Pool state
+        u64,         // reserve (APT)
+        u64,         // current_price_apt
+        u64,         // current_price_usd (using oracle)
+        u64,         // liquidity (APT)
+        u64,         // market_cap (APT)
+        vector<u8>   // sale_status
+    ) acquires ManagedFA {
+        let asset = get_metadata(creator, symbol);
+        let fa = borrow_global<ManagedFA>(object::object_address(&asset));
+        
+        // Calculate current price in APT
+        let current_price_apt = if (fa.is_graduated) {
+            fa.oracle_price
+        } else {
+            let price_multiplier = fa.k + (fa.circulating_supply / 1000000);
+            if (price_multiplier == 0) { 1 } else { price_multiplier }
+        };
+
+        // Calculate market cap in APT
+        let market_cap = fa.circulating_supply * current_price_apt;
+        
+        // Determine sale status
+        let sale_status = if (fa.is_emergency) {
+            b"Emergency"
+        } else if (fa.is_graduated) {
+            b"Graduated"
+        } else {
+            b"Bonding"
+        };
+
+        (
+            // Basic token info
+            fa.symbol,
+            fa.name,
+            fa.decimals,
+            fa.icon_url,
+            fa.project_url,
+            fa.description,
+            fa.creator,
+            fa.total_supply,
+            fa.circulating_supply,
+            // Bonding curve params
+            fa.k,
+            fa.fee_rate,
+            // RWA params
+            fa.asset_type,
+            fa.backing_ratio,
+            fa.withdrawal_limit,
+            fa.withdrawal_cooldown,
+            // Graduation params
+            fa.graduation_threshold,
+            fa.graduation_target,
+            fa.is_graduated,
+            fa.oracle_price,
+            // Pool state
+            fa.reserve,
+            current_price_apt,
+            current_price_apt,  // USD price (same as APT for now, need oracle)
+            fa.reserve,         // Liquidity = reserve
+            market_cap,
+            sale_status
+        )
     }
 
     // Get graduation progress
